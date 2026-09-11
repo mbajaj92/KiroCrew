@@ -136,6 +136,7 @@ from kiro_crew.sandbox import (
     scrub_agent_subprocess_env,
     wrap_argv,
 )
+from kiro_crew.security import is_sensitive_path
 from kiro_crew.validation import _AGENT_NAME_RE
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
@@ -3815,6 +3816,44 @@ def _agent_roster_row(
     }
 
 
+def _resolve_roster_project_path(raw: str) -> tuple[str, bool]:
+    """Resolve+validate a ``?project_path=`` query value for roster scoping.
+
+    Returns ``(resolved_path, denied)``:
+
+    * ``denied=True`` — the realpath'd target is sensitive (a protected tree
+      such as a credential home). ``resolved_path`` is ``""``; the CALLER logs
+      the SEL denial, because this runs in a worker thread and must not touch
+      ``sel()`` there.
+    * ``resolved_path=""`` with ``denied=False`` — the path is neither sensitive
+      nor an existing directory (a half-typed draft, a typo). The caller falls
+      back to the slot's project rather than scanning a non-directory.
+    * ``resolved_path=<dir>`` — a safe, existing directory to scan.
+
+    Blocking (realpath + stat), so callers run it off the event loop. The
+    ``is_sensitive_path`` check is on the RESOLVED path so a symlink into a
+    protected tree cannot slip past. ``~`` is expanded first, because the folder
+    project-dir field accepts ``~/repo``-style paths (as the chat project picker
+    does) and ``realpath`` does NOT expand a leading ``~`` — without this an
+    existing ``~/repo`` resolves to a bogus literal-tilde path, fails the isdir
+    check, and the folder's project agents silently never appear. Deliberately
+    no ``~``/absolute-path bar beyond expansion: a read-only roster scan of an
+    existing directory is not held to the cron create-time write bar, and the
+    sensitivity gate is the real protection.
+    """
+    try:
+        resolved = os.path.realpath(os.path.expanduser(raw))
+    except (OSError, ValueError):
+        # A malformed path (e.g. an embedded NUL makes realpath raise) is not a
+        # directory to scan; treat it as "nothing here", not a denial.
+        return "", False
+    if is_sensitive_path(resolved):
+        return "", True
+    if not os.path.isdir(resolved):
+        return "", False
+    return resolved, False
+
+
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
     """GET /api/agents — list all Kiro Crew agent definitions, most-used first.
 
@@ -3856,7 +3895,67 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     # Project rows come from a directory scan, so it runs on the discovery
     # pool — same rule as every other agent listing: no filesystem I/O on the
     # event loop. Failure costs only the project rows, never the roster.
-    project_dir = active_project_dir(state, _read_session_key(request)) if state else ""
+    #
+    # An explicit ``?project_path=`` overrides the slot-derived project. It is
+    # the ONLY way a surface with no chat slot yet — the folder create/settings
+    # modal, whose project directory is a draft the user is still typing — can
+    # scope the roster to that directory. Without it that modal falls back to
+    # the cross-slot ``active_project_dir``, which is never the folder's own
+    # directory, so its "default agent" picker can never list project agents.
+    # Validation (realpath + sensitivity + isdir) runs off the loop; a sensitive
+    # path is denied (SEL-logged here, on the loop) and a non-existent one
+    # resolves to "" — either way we fall back to the slot's project rather than
+    # failing the whole roster.
+    raw_project_path = request.query.get("project_path", "").strip()
+    project_dir: str | Path | None = ""
+    # ``?project_path=`` lets the caller point the scan at an ARBITRARY directory,
+    # so it is owner-only. `redact` is already True for any non-owner caller
+    # (app token, or an allow-listed messaging user holding a dashboard token);
+    # honoring the param for them would let a non-owner enumerate agent names
+    # under any readable directory. A non-owner falls through to the slot-derived
+    # scope below exactly as before this param existed.
+    if raw_project_path and not redact:
+        resolved_path, denied = await asyncio.to_thread(
+            _resolve_roster_project_path, raw_project_path
+        )
+        # An owner directing the scan at an arbitrary directory is a
+        # security-relevant action, so BOTH outcomes are audited: a sensitive
+        # path is denied (and the scan falls back to the slot scope), and an
+        # honored scan records that the owner enumerated agents under a
+        # caller-supplied directory. Without the allowed-branch event the audit
+        # trail would show only the refusals, never the scans that succeeded.
+        try:
+            _sel().log_api_access(
+                caller=request.get("user", "dashboard"),
+                operation="api_kirocrew_agents",
+                outcome="denied" if denied else "allowed",
+                source="dashboard",
+            )
+        except Exception:
+            logger.warning("SEL logging failed for owner project_path scan", exc_info=True)
+        project_dir = resolved_path
+    elif raw_project_path:
+        # A NON-OWNER (redact) carrying ?project_path= is refused: the param is
+        # ignored and the scan falls through to the slot scope. That refusal is
+        # itself a security-relevant event — a non-owner attempting to point the
+        # roster scan at an arbitrary directory — so it is audited too. Without
+        # this, the audit trail records owner scans (allowed/denied) but stays
+        # silent on every non-owner attempt, which is the exact gap the anchor
+        # backend-security-controls protects.
+        try:
+            _sel().log_api_access(
+                caller=request.get("user", "dashboard"),
+                operation="api_kirocrew_agents",
+                outcome="denied",
+                source="dashboard",
+            )
+        except Exception:
+            logger.warning(
+                "SEL logging failed for non-owner project_path attempt",
+                exc_info=True,
+            )
+    if not project_dir:
+        project_dir = active_project_dir(state, _read_session_key(request)) if state else ""
     if project_dir:
         try:
             project_names = await asyncio.get_running_loop().run_in_executor(

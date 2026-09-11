@@ -8,6 +8,9 @@ import SimpleSelect from './SimpleSelect'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { resolveFolderAgent, resolveFolderProjectDir } from '../utils/folderAgent'
+import { api } from '../api/client'
+import { useQuery } from '@tanstack/react-query'
+import { useDebouncedValue } from '../apps/file-explorer/hooks'
 import { ChatFolder, ChatTag } from '../types'
 import { i18nT } from '../i18n/t'
 
@@ -134,6 +137,18 @@ export default function FolderConfigModal({
   // erase an open draft.
   const availableTagsRef = useRef(availableTags)
   availableTagsRef.current = availableTags
+  // Read through a ref for the same reason: the global roster feeds the
+  // dir-cleared reconciliation inside the fetch effect, but must NOT be an
+  // effect dependency — `installedAgents` is a fresh array on many parent
+  // renders, and depending on it would re-run the debounced scan spuriously.
+  const installedAgentsRef = useRef(installedAgents)
+  installedAgentsRef.current = installedAgents
+  // The effective project dir the current agent SELECTION was validated against.
+  // A change to it means the user re-scoped the folder, so a previously-picked
+  // project agent absent from the NEW scope must not stay selected. Declared
+  // beside the other refs (before the seed effect that baselines it) so its
+  // initialization order is obvious.
+  const agentScopeDir = useRef('')
   const seedKey = mode === 'edit' ? folder?.id : ''
   useEffect(() => {
     if (!open) return
@@ -160,6 +175,11 @@ export default function FolderConfigModal({
       : EMPTY
     setDraft(seeded)
     seedRef.current = seeded
+    // Baseline the agent-scope tracker to the folder's OWN project dir on open,
+    // so the first roster resolve (same dir) is never seen as a re-scope and
+    // never clears a saved orphan agent. Empty for create, or a folder that
+    // inherits — the first resolve for an inherited dir then also matches.
+    agentScopeDir.current = seeded.projectDir.trim()
     setPickerOpen(false)
     setSaving(false); setSaveErr('')
   }, [open, mode, seedKey])
@@ -189,6 +209,120 @@ export default function FolderConfigModal({
     return from ? resolveFolderProjectDir(folders, from) : undefined
   }, [folders, mode, folder?.parent_id, parentId])
 
+  // The project directory whose agents this folder's chats would actually run
+  // under: the draft's own value when set, else the inherited ancestor value.
+  // This is what the agent roster must be scoped to — NOT the active chat
+  // slot's project, which is what the `installedAgents` prop carries and is
+  // unrelated to the folder being configured.
+  const effectiveProjectDir = draft.projectDir.trim() || inheritedDir || ''
+
+  // Agents discovered under `effectiveProjectDir` (its `.kiro/agents/*.json`),
+  // fetched from the backend's `?project_path=` scope via react-query. `null`
+  // (no dir set) means "use the global `installedAgents` prop"; a non-null array
+  // is that dir's roster (global rows unioned with the dir's project rows, per
+  // /api/agents).
+  //
+  // The folder modal has no chat slot, so `useAgents` — which resolves project
+  // scope from the slot — cannot serve it; this is a slot-independent lookup
+  // keyed on a draft directory the user is still typing. It is a directory-keyed
+  // `useQuery` (project convention: server state lives in react-query, not a
+  // hand-rolled effect) with the directory DEBOUNCED, so a keystroke does not
+  // fire a filesystem scan on the backend until typing settles. A ProjectPicker
+  // selection sets the whole path at once and lands one debounce later too.
+  const debouncedProjectDir = useDebouncedValue(effectiveProjectDir, 300)
+  const projectRosterQuery = useQuery({
+    // sessionKey omitted deliberately: this roster is for the DRAFT directory,
+    // not any slot. The backend reads `project_path` from the query string.
+    queryKey: ['folder-project-agents', debouncedProjectDir],
+    queryFn: () => api.kirocrewAgents(undefined, debouncedProjectDir),
+    // Only scan when a directory is actually set AND the modal is open.
+    enabled: open && !!debouncedProjectDir,
+    // A directory scan is cheap to re-read but its result is stable for the life
+    // of a modal session; keep it briefly so re-opening the same dir is instant.
+    staleTime: 30_000,
+  })
+  // `null` when no dir is set OR the scan errored — both fall back to the global
+  // prop roster, so the picker never blanks to a wrong empty selection. Only a
+  // SUCCESSFUL scan replaces the roster with the dir's agents.
+  const projectRoster: { name: string }[] | null =
+    debouncedProjectDir && projectRosterQuery.isSuccess
+      ? projectRosterQuery.data.agents || []
+      : null
+  // Loading = the modal is open with a dir set AND either the scan for the
+  // settled dir is still pending, OR the typed dir has not yet settled into the
+  // debounced value (the debounce window, before the query even starts). Submit
+  // is gated on this (see canSubmit), so a save cannot land during the window
+  // where the roster/reconciliation has not caught up to what the user typed.
+  const scanPending = open && !!debouncedProjectDir && projectRosterQuery.isPending
+  const debouncePending = open && effectiveProjectDir !== debouncedProjectDir
+  // A re-scope is pending when the EFFECTIVE project dir no longer matches the
+  // scope the current selection was last reconciled against, and that scope's
+  // debounce/scan has not caught up. Two ways the effective dir changes:
+  //   - the user edits the draft's own projectDir (draft != seed), OR
+  //   - an ANCESTOR folder's project_dir changes and this folder inherits it —
+  //     the draft's own field is untouched, so this is caught by the
+  //     effective-vs-reconciled-scope comparison, not the draft-vs-seed one.
+  // The two are OR'd because the draft-vs-seed half is correct on the very
+  // FIRST render after open (seedRef is set synchronously with the draft), when
+  // agentScopeDir — set in the seed EFFECT — is not yet baselined; the
+  // effective-vs-scope half only diverges on a later re-render (an inherited
+  // change arrives via the folders prop AFTER mount), by which point
+  // agentScopeDir is baselined. So neither half blocks the untouched initial
+  // open, and together they cover both re-scope paths.
+  const projectDirEdited = draft.projectDir !== seedRef.current.projectDir
+  const inheritedRescope =
+    open
+    && effectiveProjectDir !== agentScopeDir.current
+    && draft.projectDir.trim() === '' // only the inherited path; direct edits are the other half
+  const rosterLoading =
+    (projectDirEdited || inheritedRescope) && (scanPending || debouncePending)
+
+  // Re-scope reconciliation. When the project dir the current selection was made
+  // under CHANGES, a previously-picked project agent that the new scope does not
+  // contain must not stay selected (it would save as an orphan pointing at a
+  // project it no longer belongs to). Driven off the resolved query rather than a
+  // manual fetch callback. Guards that keep it from clearing a legitimately
+  // preserved pick:
+  //   1. only on a dir CHANGE from the scope the selection was made under;
+  //   2. only on a SUCCESSFUL scan (a failed/errored scan is treated as
+  //      "roster unknown" — fall back to global and KEEP the pick, never clear
+  //      it on a transient scan failure);
+  //   3. never the SEEDED value — an edit-mode folder's saved default_agent
+  //      round-trips even when absent from the roster (the orphan-preservation
+  //      contract), so reconciliation only touches a selection the user changed
+  //      after open.
+  // The roster it reconciles against is the dir's fetched roster when a dir is
+  // set, else the global prop (the cleared-dir fallback).
+  useEffect(() => {
+    if (!open) return
+    const dir = debouncedProjectDir
+    // With a dir set, act only once THIS dir's scan has SUCCEEDED. `isPending`
+    // covers the window right after the dir changes but before the new fetch
+    // starts (when `data` still holds the previous dir's roster); waiting for
+    // `isSuccess` additionally means a scan that ERRORED never reconciles — a
+    // failed load must not clear the user's pick, it falls back to global.
+    if (dir && !projectRosterQuery.isSuccess) return
+    if (agentScopeDir.current === dir) return
+    agentScopeDir.current = dir
+    // Judge membership against the roster the dropdown actually OFFERS for this
+    // scope: the dir's fetched agents UNIONED with the global prop roster (the
+    // backend already unions global + project rows; the prop is the global set).
+    // Reconciling against project agents alone would wrongly clear a GLOBAL
+    // agent whenever the scanned dir happens to expose no project agents.
+    const scoped: { name: string }[] = dir ? (projectRosterQuery.data?.agents || []) : []
+    const names = new Set([
+      ...scoped.map(a => a.name),
+      ...installedAgentsRef.current.map(a => a.name),
+    ])
+    setDraft(cur =>
+      cur.defaultAgent
+        && cur.defaultAgent !== seedRef.current.defaultAgent
+        && !names.has(cur.defaultAgent)
+        ? { ...cur, defaultAgent: '' }
+        : cur
+    )
+  }, [open, debouncedProjectDir, projectRosterQuery.data, projectRosterQuery.isSuccess])
+
   // The default agent inherits the same way, so the empty option has to name the
   // agent an empty selection would ACTUALLY run: the nearest ancestor that pins
   // one, and only then the global default. Naming the global default
@@ -202,21 +336,40 @@ export default function FolderConfigModal({
   }, [folders, mode, folder?.parent_id, parentId, globalDefaultAgent])
 
   const trimmedName = draft.name.trim()
-  const canSubmit = trimmedName.length > 0
+  // Block submit while the project-dir scan is in flight. The re-scope
+  // reconciliation that clears a now-invalid agent runs only once the new dir's
+  // roster resolves; saving during that window would persist the pre-scan
+  // selection — a stale project agent pointing at a directory it no longer
+  // belongs to. Holding submit until `rosterLoading` clears closes that race.
+  const canSubmit = trimmedName.length > 0 && !rosterLoading
+
+  // The roster the picker actually offers: the project directory's agents when
+  // one is set (union of global + that dir's project agents, from the backend),
+  // otherwise the global `installedAgents` prop. Scoping the dropdown to the
+  // folder's own directory is the whole fix — the prop is the ACTIVE SLOT's
+  // roster, which has nothing to do with the folder being configured.
+  const effectiveAgents = projectRoster ?? installedAgents
 
   // A folder can reference an agent that is no longer installed (uninstalled or
   // renamed). Without an option for it the select falls back to showing the
   // first entry — "None" — and Save would then write default_agent:'' and
   // silently destroy the folder's configuration. Keep the orphan selectable so
   // it round-trips, flagged so the user knows why it isn't running.
-  const orphanAgent = draft.defaultAgent && !installedAgents.some(a => a.name === draft.defaultAgent)
+  //
+  // Measured against the EFFECTIVE roster, and only once it has resolved: while
+  // the project scan is in flight `effectiveAgents` is still the global prop,
+  // which would falsely flag a valid project agent as an orphan. Suppressing
+  // the flag during the load keeps the selected value selectable without the
+  // "not installed" label flickering onto a real project agent.
+  const orphanAgent = draft.defaultAgent && !rosterLoading
+    && !effectiveAgents.some(a => a.name === draft.defaultAgent)
     ? draft.defaultAgent
     : ''
 
   // Values and display labels as two PARALLEL arrays, orphan first so it keeps
   // the position its <option> held. The '' ("None" / "Inherit (x)") row is
   // SimpleSelect's `clearLabel` rather than a member of these arrays.
-  const agentNames = installedAgents.map(a => a.name)
+  const agentNames = effectiveAgents.map(a => a.name)
   const agentOptions = orphanAgent ? [orphanAgent, ...agentNames] : agentNames
   const agentOptionLabels = orphanAgent
     ? [i18nT('components.folderConfigModal.agent_not_installed', { agent: orphanAgent }), ...agentNames]
