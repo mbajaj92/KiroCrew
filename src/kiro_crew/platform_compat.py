@@ -4575,6 +4575,139 @@ def pin_directory(path: str | os.PathLike) -> int:
     return fd
 
 
+def verify_ancestors_not_swapped(path: str | os.PathLike) -> bool:
+    r"""True when every component of *path*, root-to-leaf, is still what its
+    own parent's listing says it is -- Windows only.
+
+    ``pin_directory``'s ``FILE_FLAG_OPEN_REPARSE_POINT`` guards only the FINAL
+    path component: Windows' ``CreateFileW`` still resolves and follows a
+    reparse point on any ANCESTOR while getting there, so a junction planted
+    above *path* (e.g. targeting ``\\attacker\share``) is silently traversed
+    by the pin's own open before the leaf is ever inspected -- an outbound
+    SMB/NTLM credential exposure. The real atomic fix is Windows' NT-native
+    ``NtCreateFile`` with ``OBJECT_ATTRIBUTES.RootDirectory`` chained
+    handle-to-handle, the equivalent of POSIX ``openat`` -- but that is an
+    undocumented-for-general-use kernel-adjacent API with no verified,
+    testable binding reachable from this Linux-developed codebase; getting
+    the ``UNICODE_STRING``/``OBJECT_ATTRIBUTES`` layout wrong risks a
+    corrupted or falsely-valid handle, which is worse than the window this
+    closes.
+
+    This instead reuses the pattern :mod:`project_scan`'s Windows
+    ``_scandir_pinned`` branch already established for exactly this problem
+    during a tree walk, generalized here to an arbitrary caller-supplied
+    path rather than a scan-tree descent: hold each directory open with
+    Python's own stdlib ``_winapi.CreateFile`` (not hand-rolled ``ctypes`` --
+    the same binding CPython's own subprocess/multiprocessing internals use)
+    WITHOUT ``FILE_SHARE_DELETE``, which is what closes the window -- NTFS
+    refuses to rename or delete a directory, or anything above it, while a
+    handle to it is open, so the very rename-to-a-junction a swap attack
+    needs cannot happen while the hold is live. Walking root-to-leaf and
+    checking each component's ``realpath`` against "parent's realpath + this
+    name" BEFORE descending makes the guarantee inductive: a component is
+    only trusted once everything above it has already been proven
+    link-free and unchanged, exactly the property an atomic open chain would
+    give, built one hold at a time instead.
+
+    Returns ``False`` on any failure to hold or resolve a component (fail
+    closed: an unverifiable ancestor chain is not a verified one) or when a
+    mismatch is found. POSIX has no reparse points to run this ancestor race
+    and this is never called there.
+    """
+    # os.path.realpath must never run on a component before that component's
+    # own hold is taken: on Windows realpath calls _getfinalpathname, which
+    # OPENS the path and follows a reparse point on every ancestor while
+    # doing so -- exactly the SMB/NTLM leak this function exists to prevent.
+    # The fix is to never resolve anything the walk has not already HELD: split the raw, unresolved string lexically first (ntpath parsing
+    # touches no filesystem), then carry the previous level's own
+    # already-verified realpath forward instead of re-deriving it by
+    # realpath-ing a path string that is not itself under a hold at the
+    # moment of that call -- the same induction _scandir_pinned's Windows
+    # branch relies on: a component's realpath is only ever taken while
+    # THAT component's own hold is active, and the level below it trusts the
+    # ancestor's realpath because that level already proved it, not because
+    # it re-checks it.
+    try:
+        raw = os.fspath(path)
+    except TypeError:
+        return False
+    drive, tail = ntpath.splitdrive(raw)
+    parts = [p for p in tail.split(ntpath.sep) if p]
+    if not parts:
+        return True
+    current = drive + ntpath.sep
+    # The drive root has no ancestor to be swapped out from under it, so its
+    # realpath needs no filesystem check -- it is trusted as the base case,
+    # exactly like a scan's own root is the caller's to validate before the
+    # first _scandir_pinned call.
+    try:
+        current_resolved = os.path.realpath(current)
+    except (OSError, ValueError):
+        return False
+    handle = None
+    try:
+        for part in parts:
+            nxt = ntpath.join(current, part)
+            try:
+                nxt_handle = _win_hold_directory_no_share_delete(nxt)
+            except OSError:
+                return False
+            # Only NOW, with nxt's own hold already live, is it safe to
+            # resolve it: the hold blocks nxt (and everything below it) from
+            # being renamed to a junction while this realpath call runs, so
+            # what gets resolved here is guaranteed to still be the thing
+            # just opened.
+            try:
+                nxt_resolved = os.path.realpath(nxt)
+            except (OSError, ValueError):
+                _win_close_handle(nxt_handle)
+                return False
+            expected = ntpath.join(current_resolved, part)
+            if os.path.normcase(nxt_resolved) != os.path.normcase(expected):
+                _win_close_handle(nxt_handle)
+                return False
+            if handle is not None:
+                _win_close_handle(handle)
+            handle = nxt_handle
+            current = nxt
+            current_resolved = nxt_resolved
+    finally:
+        if handle is not None:
+            _win_close_handle(handle)
+    return True
+
+
+def _win_hold_directory_no_share_delete(directory: str) -> int:
+    """Open *directory* WITHOUT ``FILE_SHARE_DELETE``, refusing nothing else.
+
+    Shared plumbing for :func:`verify_ancestors_not_swapped`. Uses the stdlib
+    ``_winapi`` module -- the same CPython-maintained binding
+    ``project_scan.py``'s ``_hold_directory`` already uses for this identical
+    problem -- rather than a hand-rolled ``ctypes`` structure. Holding the
+    handle (not the reparse-point refusal ``pin_directory`` uses) is the
+    whole point here: this is checking ANCESTORS, which must be traversable
+    normally, only refusing that they be swappable WHILE the check is live.
+    """
+    import _winapi  # type: ignore[import-not-found]
+
+    return _winapi.CreateFile(  # type: ignore[attr-defined]
+        directory,
+        0x0080,  # FILE_READ_ATTRIBUTES
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        _winapi.NULL,  # type: ignore[attr-defined]
+        _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        _winapi.NULL,  # type: ignore[attr-defined]
+    )
+
+
+def _win_close_handle(handle: int) -> None:
+    """Release a handle opened by :func:`_win_hold_directory_no_share_delete`."""
+    import _winapi  # type: ignore[import-not-found]
+
+    _winapi.CloseHandle(handle)  # type: ignore[attr-defined]
+
+
 def _win_open_without_following(path: str | os.PathLike) -> int:
     """``CreateFileW`` *path* for reading, opening a reparse point INSTEAD of following it.
 

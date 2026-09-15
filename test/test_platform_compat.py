@@ -1145,6 +1145,138 @@ class TestPinDirectory:
         assert (tmp_path / "swapped").is_dir()
 
 
+class TestVerifyAncestorsNotSwapped:
+    """``verify_ancestors_not_swapped``: root-to-leaf, hold each component while
+    checking it, so no ancestor can be renamed to a junction mid-walk.
+
+    ``_winapi`` (the plumbing this calls) does not exist as an importable
+    module off real Windows, so every test here mocks the two low-level
+    helpers (`_win_hold_directory_no_share_delete` / `_win_close_handle`) and
+    exercises the actual ``ntpath``-based walk and comparison logic, which is
+    genuinely platform-independent and is what a mistake in this function
+    would actually get wrong.
+    """
+
+    def test_benign_path_walks_root_to_leaf_and_returns_true(self, monkeypatch) -> None:
+        opened: list[str] = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pc, "_win_hold_directory_no_share_delete", lambda p: (opened.append(p), 77)[1]
+        )
+        monkeypatch.setattr(pc, "_win_close_handle", lambda _h: None)
+        # Every path "resolves to itself" -- the benign case.
+        monkeypatch.setattr(pc.os.path, "realpath", lambda p: p)
+
+        assert pc.verify_ancestors_not_swapped(r"C:\Users\me\repo\.kiro\agents") is True
+        assert opened == [
+            r"C:\Users",
+            r"C:\Users\me",
+            r"C:\Users\me\repo",
+            r"C:\Users\me\repo\.kiro",
+            r"C:\Users\me\repo\.kiro\agents",
+        ]
+
+    def test_swapped_ancestor_is_detected_and_denies(self, monkeypatch) -> None:
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_win_hold_directory_no_share_delete", lambda _p: 77)
+        closed: list[int] = []
+        monkeypatch.setattr(pc, "_win_close_handle", lambda h: closed.append(h))
+        real_realpath = os.path.realpath
+
+        def _lying_realpath(p):
+            # "repo" claims to resolve somewhere else entirely -- as if it had
+            # been swapped for a junction after the walk reached it.
+            if str(p).endswith("repo"):
+                return r"\\attacker\share"
+            return real_realpath(p) if os.path.isabs(str(p)) and os.sep in str(p) else p
+
+        monkeypatch.setattr(pc.os.path, "realpath", _lying_realpath)
+
+        assert pc.verify_ancestors_not_swapped(r"C:\Users\me\repo\.kiro\agents") is False
+        # The handle opened on the swapped component must still be released.
+        assert closed
+
+    def test_a_hold_that_cannot_be_taken_denies_rather_than_falls_back(self, monkeypatch) -> None:
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+
+        def _refuse(_p):
+            raise OSError("cannot open (simulated)")
+
+        monkeypatch.setattr(pc, "_win_hold_directory_no_share_delete", _refuse)
+        monkeypatch.setattr(pc.os.path, "realpath", lambda p: p)
+
+        assert pc.verify_ancestors_not_swapped(r"C:\Users\me\repo") is False
+
+    def test_every_opened_handle_is_released_even_on_success(self, monkeypatch) -> None:
+        opened: list[int] = []
+        closed: list[int] = []
+        counter = iter(range(1, 100))
+
+        def _hold(_p):
+            fd = next(counter)
+            opened.append(fd)
+            return fd
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_win_hold_directory_no_share_delete", _hold)
+        monkeypatch.setattr(pc, "_win_close_handle", lambda h: closed.append(h))
+        monkeypatch.setattr(pc.os.path, "realpath", lambda p: p)
+
+        assert pc.verify_ancestors_not_swapped(r"C:\Users\me\repo") is True
+        # Every handle that was opened must eventually be closed -- no leak,
+        # including the last one, which the normal walk loop never gets to
+        # close explicitly (only the `finally` does).
+        assert sorted(closed) == sorted(opened)
+
+    def test_realpath_is_never_called_on_a_component_before_its_own_hold(self, monkeypatch) -> None:
+        """``os.path.realpath`` on Windows opens the path and follows a
+        reparse point on every ancestor while doing so, which is exactly the
+        SMB/NTLM leak this function exists to prevent. Every ``realpath``
+        call on a non-drive-root component must happen strictly AFTER that
+        same component's own hold has already been taken -- never before,
+        and never on the raw input path itself.
+        """
+        held: set[str] = set()
+        realpath_calls: list[str] = []
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+
+        def _hold(p):
+            held.add(p)
+            return 77
+
+        def _lying_realpath(p):
+            # A component may only be resolved once it is itself held (the
+            # drive root is the one exception -- it has no ancestor to be
+            # swapped, so it needs no hold before its own first resolution).
+            realpath_calls.append(p)
+            drive_root = pc.ntpath.splitdrive(r"C:\Users\me\repo")[0] + pc.ntpath.sep
+            if p not in held and p != drive_root:
+                raise AssertionError(
+                    f"realpath called on {p!r} before it was held — the exact "
+                    "SMB/NTLM leak this test guards against"
+                )
+            return p
+
+        monkeypatch.setattr(pc, "_win_hold_directory_no_share_delete", _hold)
+        monkeypatch.setattr(pc, "_win_close_handle", lambda _h: None)
+        monkeypatch.setattr(pc.os.path, "realpath", _lying_realpath)
+
+        assert pc.verify_ancestors_not_swapped(r"C:\Users\me\repo") is True
+        # Each realpath call must be on an incrementally-built PARENT-first
+        # component, in ancestor order -- starting from the drive root (the
+        # untrusted base case, safe because it has no ancestor of its own)
+        # and never once on the full raw string handed straight through
+        # (which would mean the leading full-path realpath this test guards
+        # against is back).
+        assert realpath_calls == [
+            "C:\\",
+            r"C:\Users",
+            r"C:\Users\me",
+            r"C:\Users\me\repo",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # POSIX-branch coverage for the new platform_compat helpers. The
 # tests below deliberately exercise the ``if IS_POSIX:`` / Linux ``/proc`` paths
